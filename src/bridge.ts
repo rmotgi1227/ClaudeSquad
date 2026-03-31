@@ -13,7 +13,7 @@ import {
 import * as path from "path";
 import { execSync } from "child_process";
 import { daemonRpc } from "./client.js";
-import { makeInstanceId, nowMs, getRepoId, formatAge, DEFAULT_MESSAGES_LIMIT } from "./types.js";
+import { makeInstanceId, nowMs, getRepoId, formatAge, DEFAULT_MESSAGES_LIMIT, type Standup } from "./types.js";
 
 const STARTUP_TS = nowMs();
 const PID = process.pid;
@@ -33,6 +33,10 @@ let instanceId: string | null = null;
 // Resolved once at startup; stable for the lifetime of this process
 let instanceRepo: string = getRepoId(CWD);
 
+// Standup notice: set on registration, prepended to the first tool call response
+let pendingStandup: string | null = null;
+let firstCallDone = false;
+
 async function register(): Promise<string> {
   const branch = getCurrentBranch();
   const result = await daemonRpc("register", {
@@ -42,7 +46,21 @@ async function register(): Promise<string> {
     repo: instanceRepo,
     pid: PID,
     startup_ts: STARTUP_TS,
-  }) as { instance_id: string; standup: unknown };
+  }) as { instance_id: string; standup: Standup };
+
+  const { active_instances } = result.standup ?? {};
+  if (active_instances?.length) {
+    const others = active_instances.filter(
+      (i) => i.name !== INSTANCE_NAME || i.cwd !== CWD
+    );
+    if (others.length) {
+      const names = others
+        .map((i) => `${i.name}${i.branch ? `@${i.branch}` : ""} (${formatAge(i.last_seen)})`)
+        .join(", ");
+      pendingStandup = `[Squad: ${others.length} instance${others.length > 1 ? "s" : ""} active — ${names}. Call read_messages to catch up.]`;
+    }
+  }
+
   return result.instance_id;
 }
 
@@ -140,15 +158,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (!instanceId) {
-    instanceId = await register();
-  }
-
-  const { name, arguments: args = {} } = req.params;
-
-  try {
-    switch (name) {
+async function handleTool(
+  name: string,
+  args: Record<string, unknown>,
+  id: string
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+  switch (name) {
       case "broadcast": {
         const result = await daemonRpc("broadcast", {
           instance_id: instanceId,
@@ -252,12 +267,37 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (!instanceId) {
+    instanceId = await register();
+  }
+
+  const { name, arguments: args = {} } = req.params;
+
+  let result: { content: Array<{ type: string; text: string }>; isError?: boolean };
+  try {
+    result = await handleTool(name, args as Record<string, unknown>, instanceId);
   } catch (err) {
-    return {
+    result = {
       content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
       isError: true,
     };
   }
+
+  // Prepend standup notice on the first tool call of this bridge process
+  if (!firstCallDone && pendingStandup) {
+    firstCallDone = true;
+    const notice = pendingStandup;
+    pendingStandup = null;
+    result = {
+      ...result,
+      content: [{ type: "text" as const, text: notice }, ...result.content],
+    };
+  }
+
+  return result;
 });
 
 async function main(): Promise<void> {
