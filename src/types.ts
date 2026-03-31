@@ -160,6 +160,18 @@ export function isWindows(): boolean {
  * Falls back to cwd if not in a git repo.
  */
 export function getRepoId(cwd: string = process.cwd()): string {
+  // Try remote URL first — normalizes across separate clones of the same repo
+  try {
+    const remote = execSync("git remote get-url origin", {
+      encoding: "utf8",
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 3000,
+    }).trim();
+    if (remote) return normalizeRemoteUrl(remote);
+  } catch { /* no remote, fall through */ }
+
+  // Fall back to local git-common-dir (handles worktrees, no-remote repos)
   try {
     const commonDir = execSync("git rev-parse --git-common-dir", {
       encoding: "utf8",
@@ -167,10 +179,27 @@ export function getRepoId(cwd: string = process.cwd()): string {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 3000,
     }).trim();
-    // '.git' is relative (main worktree); absolute path for linked worktrees
     return path.resolve(cwd, commonDir);
   } catch {
     return cwd;
+  }
+}
+
+/**
+ * Normalize git remote URLs so https and ssh forms of the same repo match.
+ * https://github.com/user/repo.git → github.com/user/repo
+ * git@github.com:user/repo.git    → github.com/user/repo
+ */
+function normalizeRemoteUrl(url: string): string {
+  // SSH: git@github.com:user/repo.git
+  const ssh = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+  if (ssh) return `${ssh[1]}/${ssh[2]}`;
+  // HTTPS: https://github.com/user/repo.git
+  try {
+    const u = new URL(url);
+    return (u.host + u.pathname).replace(/\.git$/, "").replace(/\/$/, "");
+  } catch {
+    return url;
   }
 }
 
