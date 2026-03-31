@@ -26,21 +26,39 @@ const PASSIVE_BLOCK = (mode = "passive") =>
   `<!-- ccsquad:start mode=${mode} -->
 ## ccsquad coordination
 
-On session start: call \`list_instances\` and \`read_messages\` to catch up on squad activity.
-Answer squad questions when asked. Broadcast major architectural decisions (new DB schema,
-error handling pattern, shared utility, API contract change).
+**On session start:** call \`list_instances\` and \`read_messages\` to catch up on squad activity.
+
+**During the session — offer to broadcast after any of these:**
+- Shipping or landing code
+- Finishing a plan or architecture decision
+- Establishing a convention (error handling, naming, DB schema, API shape)
+- Finding a bug root cause
+- Creating a shared utility
+
+After completing any of the above, ask the user: "Want me to broadcast this to the squad? (y/n)"
+If yes, call \`broadcast\` with a concise summary of what was decided or built.
+
+**Always:** answer squad questions when asked (\`read_messages\`, \`answer\`).
 <!-- ccsquad:end -->`;
 
 const AGGRESSIVE_BLOCK =
   `<!-- ccsquad:start mode=aggressive -->
 ## ccsquad coordination
 
-On session start: call \`list_instances\` and \`read_messages\`.
-Before any of these: broadcast intent first — schema changes, new shared utilities,
-API design decisions, error handling patterns.
-Examples: adding a DB table, creating a shared util function, choosing an HTTP error shape.
-After completing significant work: broadcast what you built and conventions established.
-Answer squad questions proactively.
+**On session start:** call \`list_instances\` and \`read_messages\`.
+
+**Before any of these, broadcast intent first** so other instances can weigh in:
+- Schema changes or new DB tables
+- New shared utilities or helper functions
+- API design decisions or contract changes
+- Error handling pattern choices
+
+**After completing any significant work**, offer to broadcast: "Want me to broadcast this to the squad? (y/n)"
+If yes, call \`broadcast\` with what was built and any conventions established.
+
+**After finishing a plan, review, investigation, or ship:** always offer to broadcast the key outcome.
+
+**Always:** answer squad questions proactively (\`read_messages\`, \`answer\`).
 <!-- ccsquad:end -->`;
 
 function getTemplate(mode: "passive" | "aggressive"): string {
@@ -200,7 +218,22 @@ export async function runInit(opts: InitOptions = {}): Promise<void> {
     }
   }
 
-  // Step 5: Start daemon if not running
+  // Step 5: Install /squad gstack skill (copy SKILL.md to ~/.claude/skills/squad/)
+  try {
+    const skillSrc = path.join(path.dirname(new URL(import.meta.url).pathname), "../skills/squad/SKILL.md");
+    const skillDest = path.join(os.homedir(), ".claude", "skills", "squad", "SKILL.md");
+    if (fs.existsSync(skillSrc)) {
+      fs.mkdirSync(path.dirname(skillDest), { recursive: true });
+      fs.copyFileSync(skillSrc, skillDest);
+      modified.push(skillDest);
+      console.log(`✓ /squad gstack skill installed at ${skillDest}`);
+    }
+  } catch (err) {
+    // Non-fatal: skill install is a quality bonus
+    console.error(`  Could not install /squad skill: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Step 6: Start daemon if not running
   try {
     await ensureRunning();
     console.log(`✓ Daemon running`);
