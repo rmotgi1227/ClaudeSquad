@@ -10,16 +10,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import * as os from "os";
 import * as path from "path";
 import { execSync } from "child_process";
 import { daemonRpc } from "./client.js";
-import { makeInstanceId, nowMs, DEFAULT_MESSAGES_LIMIT } from "./types.js";
+import { makeInstanceId, nowMs, getRepoId, formatAge, DEFAULT_MESSAGES_LIMIT } from "./types.js";
 
 const STARTUP_TS = nowMs();
 const PID = process.pid;
 
-// Instance config from env (user sets CLAUDE_SQUAD_NAME=Frontend)
 const INSTANCE_NAME = process.env.CLAUDE_SQUAD_NAME || path.basename(process.cwd());
 const CWD = process.cwd();
 
@@ -32,6 +30,8 @@ function getCurrentBranch(): string | null {
 }
 
 let instanceId: string | null = null;
+// Resolved once at startup; stable for the lifetime of this process
+let instanceRepo: string = getRepoId(CWD);
 
 async function register(): Promise<string> {
   const branch = getCurrentBranch();
@@ -39,6 +39,7 @@ async function register(): Promise<string> {
     name: INSTANCE_NAME,
     cwd: CWD,
     branch,
+    repo: instanceRepo,
     pid: PID,
     startup_ts: STARTUP_TS,
   }) as { instance_id: string; standup: unknown };
@@ -140,7 +141,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  // Lazy register on first tool call
   if (!instanceId) {
     instanceId = await register();
   }
@@ -165,6 +165,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           since: args.since,
           tags: args.tags,
           limit: args.limit,
+          repo: instanceRepo,
         }) as { messages: unknown[] };
         const msgs = result.messages;
         if (msgs.length === 0) {
@@ -205,7 +206,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "list_instances": {
-        const result = await daemonRpc("list_instances", {}) as { instances: unknown[] };
+        const result = await daemonRpc("list_instances", { repo: instanceRepo }) as { instances: unknown[] };
         const instances = result.instances;
         if (instances.length === 0) {
           return { content: [{ type: "text", text: "No active instances." }] };
@@ -232,7 +233,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "get_shared": {
-        const result = await daemonRpc("get_shared", { key: args.key as string }) as { entry: unknown };
+        const result = await daemonRpc("get_shared", {
+          key: args.key as string,
+          repo: instanceRepo,
+        }) as { entry: unknown };
         if (!result.entry) {
           return { content: [{ type: "text", text: `Key '${args.key}' not found.` }] };
         }
@@ -256,21 +260,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-function formatAge(ms: number): string {
-  const diff = nowMs() - ms;
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  return `${Math.floor(diff / 3_600_000)}h ago`;
-}
-
 async function main(): Promise<void> {
-  // Heartbeat on process events (simulating PostToolUse behavior within the bridge)
   setInterval(async () => {
     if (instanceId) {
       const branch = getCurrentBranch();
       await daemonRpc("heartbeat", { instance_id: instanceId, branch }).catch(() => {});
     }
-  }, 60_000); // every 60s background ping
+  }, 60_000);
 
   process.on("SIGTERM", async () => {
     if (instanceId) {

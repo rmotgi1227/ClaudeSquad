@@ -71,10 +71,10 @@ async function startTestDaemon(): Promise<{ socketPath: string; dbPath: string; 
     switch (req.method) {
       case "ping": return { pong: true };
       case "register": {
-        const p = req.params as { name: string; cwd: string; branch?: string; pid: number; startup_ts: number };
+        const p = req.params as { name: string; cwd: string; branch?: string; repo?: string; pid: number; startup_ts: number };
         const id = makeInstanceId(p.name, p.cwd, p.pid, p.startup_ts);
-        upsertInstance(db, id, p.name, p.cwd, p.branch ?? null);
-        return { instance_id: id, standup: buildStandup(db) };
+        upsertInstance(db, id, p.name, p.cwd, p.branch ?? null, p.repo ?? "local");
+        return { instance_id: id, standup: buildStandup(db, p.repo) };
       }
       case "heartbeat": {
         const p = req.params as { instance_id: string; branch?: string };

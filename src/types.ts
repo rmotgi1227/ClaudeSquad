@@ -1,12 +1,16 @@
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
+import { execSync } from "child_process";
 
 export const SQUAD_DIR = path.join(os.homedir(), ".claude-squad");
 export const SOCKET_PATH = path.join(SQUAD_DIR, "server.sock");
 export const LOCK_PATH = path.join(SQUAD_DIR, "server.lock");
 export const DB_PATH = path.join(SQUAD_DIR, "state.db");
 export const PORT_PATH = path.join(SQUAD_DIR, "port");
+export const DAEMON_PID_PATH = path.join(SQUAD_DIR, "daemon.pid");
+export const SHUTDOWN_TOKEN_PATH = path.join(SQUAD_DIR, "shutdown.token");
+export const STATUS_CACHE_PATH = path.join(SQUAD_DIR, "status-cache");
 export const TCP_PORT_BASE = 38475;
 export const TCP_PORT_MAX = 38499;
 
@@ -16,12 +20,14 @@ export const MAX_MESSAGES_LIMIT = 20;
 export const DEFAULT_MESSAGES_LIMIT = 5;
 export const STALE_INSTANCE_MS = 30 * 60 * 1000; // 30 minutes
 export const SQLITE_BUSY_TIMEOUT_MS = 5000;
+export const STATUS_CACHE_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 
 export interface Instance {
   id: string;
   name: string;
   cwd: string;
   branch: string | null;
+  repo: string;
   last_seen: number; // millisecond epoch
 }
 
@@ -38,6 +44,7 @@ export interface Message {
 
 export interface KVEntry {
   key: string;
+  repo: string;
   value: string;
   set_by: string;
   updated_at: number;
@@ -66,6 +73,7 @@ export interface RegisterParams {
   name: string;
   cwd: string;
   branch?: string;
+  repo: string;
   pid: number;
   startup_ts: number;
 }
@@ -80,6 +88,7 @@ export interface ReadMessagesParams {
   since?: number;
   tags?: string[];
   limit?: number;
+  repo?: string;
 }
 
 export interface AskParams {
@@ -107,6 +116,11 @@ export interface SetSharedParams {
 
 export interface GetSharedParams {
   key: string;
+  repo: string;
+}
+
+export interface ListInstancesParams {
+  repo?: string;
 }
 
 export function makeInstanceId(name: string, cwd: string, pid: number, startupTs: number): string {
@@ -120,4 +134,31 @@ export function nowMs(): number {
 
 export function isWindows(): boolean {
   return process.platform === "win32";
+}
+
+/**
+ * Get a stable repo identifier for the given working directory.
+ * Uses git --git-common-dir so all worktrees of the same repo share the same ID.
+ * Falls back to cwd if not in a git repo.
+ */
+export function getRepoId(cwd: string = process.cwd()): string {
+  try {
+    const commonDir = execSync("git rev-parse --git-common-dir", {
+      encoding: "utf8",
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 3000,
+    }).trim();
+    // '.git' is relative (main worktree); absolute path for linked worktrees
+    return path.resolve(cwd, commonDir);
+  } catch {
+    return cwd;
+  }
+}
+
+export function formatAge(ms: number): string {
+  const diff = nowMs() - ms;
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  return `${Math.floor(diff / 3_600_000)}h ago`;
 }

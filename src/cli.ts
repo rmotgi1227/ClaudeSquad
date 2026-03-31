@@ -2,13 +2,15 @@
 /**
  * claude-squad CLI entry point
  * Usage:
- *   claude-squad                  → starts the MCP bridge (stdio)
- *   claude-squad --ensure-running → starts daemon if not running, then exits
- *   claude-squad status           → print active instances + recent messages
- *   claude-squad export           → dump channel history as markdown
- *   claude-squad daemon           → start the daemon directly (for debugging)
+ *   claude-squad                       → starts the MCP bridge (stdio)
+ *   claude-squad --ensure-running      → starts daemon if not running, then exits
+ *   claude-squad init [opts]           → setup: MCP + CLAUDE.md + optional status line
+ *   claude-squad uninstall             → remove everything
+ *   claude-squad status [--short]      → print active instances + recent messages
+ *   claude-squad export                → dump channel history as markdown
+ *   claude-squad daemon                → start the daemon directly (for debugging)
  */
-import { nowMs } from "./types.js";
+import { formatAge } from "./types.js";
 
 const args = process.argv.slice(2);
 
@@ -20,13 +22,29 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "daemon") {
-    // Just run the daemon inline (for debugging or direct invocation)
     await import("./daemon.js");
     return;
   }
 
+  if (args[0] === "init") {
+    const { runInit } = await import("./init.js");
+    const modeIdx = args.indexOf("--mode");
+    await runInit({
+      update: args.includes("--update"),
+      mode: modeIdx !== -1 ? (args[modeIdx + 1] as "passive" | "aggressive") : undefined,
+      statusLine: args.includes("--status-line"),
+    });
+    process.exit(0);
+  }
+
+  if (args[0] === "uninstall") {
+    const { runUninstall } = await import("./uninstall.js");
+    await runUninstall();
+    process.exit(0);
+  }
+
   if (args[0] === "status") {
-    await runStatus();
+    await runStatus(args.includes("--short"));
     process.exit(0);
   }
 
@@ -41,11 +59,11 @@ async function main(): Promise<void> {
   await import("./bridge.js");
 }
 
-async function runStatus(): Promise<void> {
+async function runStatus(short = false): Promise<void> {
   const { daemonRpc, isDaemonRunning } = await import("./client.js");
 
   if (!(await isDaemonRunning())) {
-    console.log("claude-squad: daemon not running");
+    if (!short) console.log("claude-squad: daemon not running");
     return;
   }
 
@@ -53,6 +71,14 @@ async function runStatus(): Promise<void> {
     daemonRpc("list_instances", {}) as Promise<{ instances: Array<{ name: string; branch?: string; cwd: string; last_seen: number }> }>,
     daemonRpc("read_messages", { limit: 10 }) as Promise<{ messages: Array<{ instance_name?: string; type: string; content: string; created_at: number; id: number }> }>,
   ]);
+
+  if (short) {
+    const count = messagesResult.messages.length;
+    if (count > 0) {
+      process.stdout.write(`● ${count} squad msg${count !== 1 ? "s" : ""}\n`);
+    }
+    return;
+  }
 
   console.log("\n=== claude-squad status ===\n");
 
@@ -111,13 +137,6 @@ async function runExport(): Promise<void> {
   }
 
   console.log(lines.join("\n"));
-}
-
-function formatAge(ms: number): string {
-  const diff = nowMs() - ms;
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  return `${Math.floor(diff / 3_600_000)}h ago`;
 }
 
 main().catch((err) => {
