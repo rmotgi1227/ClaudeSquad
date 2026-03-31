@@ -26,7 +26,7 @@ export function openDb(dbPath = DB_PATH): Database.Database {
   db.pragma("foreign_keys = ON");
   initSchema(db);
   migrateSchema(db);
-  ensureRepoIndex(db);
+  ensureIndexes(db);
   purgeStaleInstances(db);
   return db;
 }
@@ -39,6 +39,7 @@ function initSchema(db: Database.Database): void {
       cwd TEXT NOT NULL,
       branch TEXT,
       repo TEXT NOT NULL DEFAULT 'local',
+      slot INTEGER,
       last_seen INTEGER NOT NULL
     );
 
@@ -50,6 +51,7 @@ function initSchema(db: Database.Database): void {
       tags TEXT,
       reply_to INTEGER,
       repo TEXT NOT NULL DEFAULT 'local',
+      to_instance_id TEXT,
       created_at INTEGER NOT NULL
     );
 
@@ -64,12 +66,10 @@ function initSchema(db: Database.Database): void {
       PRIMARY KEY (key, repo)
     );
   `);
-
 }
 
 /**
- * Migrate v1 schema (no repo columns) to v2.
- * Wrapped in a transaction — partial migration leaves DB at v1 and retries next startup.
+ * Migrate v1 schema (no repo columns) to v2, then v2 to v3 (slot + to_instance_id).
  */
 function migrateSchema(db: Database.Database): void {
   const version = db.pragma("user_version", { simple: true }) as number;
@@ -79,44 +79,72 @@ function migrateSchema(db: Database.Database): void {
   const cols = db.pragma("table_info(instances)") as Array<{ name: string }>;
   const hasRepo = cols.some((c) => c.name === "repo");
 
-  if (version >= 2 || hasRepo) {
-    // Fresh DB or already migrated — just ensure version is stamped
-    if (version < 2) db.pragma("user_version = 2");
-    return;
+  if (version < 2 && !hasRepo) {
+    process.stderr.write("claude-squad: migrating schema to v2 (adding repo scoping)...\n");
+
+    const migrate = db.transaction(() => {
+      db.exec(`ALTER TABLE instances ADD COLUMN repo TEXT NOT NULL DEFAULT 'legacy'`);
+      db.exec(`ALTER TABLE messages ADD COLUMN repo TEXT NOT NULL DEFAULT 'legacy'`);
+      // kv needs composite PK (key, repo) — recreate the table
+      db.exec(`
+        CREATE TABLE kv_v2 (
+          key TEXT NOT NULL,
+          repo TEXT NOT NULL DEFAULT 'legacy',
+          value TEXT NOT NULL,
+          set_by TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (key, repo)
+        );
+        INSERT INTO kv_v2 SELECT key, 'legacy', value, set_by, updated_at FROM kv;
+        DROP TABLE kv;
+        ALTER TABLE kv_v2 RENAME TO kv;
+      `);
+    });
+
+    migrate();
+    db.pragma("user_version = 2");
+
+    process.stderr.write(
+      "claude-squad: migration complete. Existing data tagged as repo='legacy'.\n"
+    );
+  } else if (version < 2) {
+    db.pragma("user_version = 2");
   }
 
-  process.stderr.write("claude-squad: migrating schema to v2 (adding repo scoping)...\n");
+  // v3: add slot to instances, to_instance_id to messages (if missing), backfill slot
+  const currentVersion = db.pragma("user_version", { simple: true }) as number;
+  if (currentVersion < 3) {
+    process.stderr.write("claude-squad: migrating schema to v3 (slot + directed messages)...\n");
 
-  const migrate = db.transaction(() => {
-    db.exec(`ALTER TABLE instances ADD COLUMN repo TEXT NOT NULL DEFAULT 'legacy'`);
-    db.exec(`ALTER TABLE messages ADD COLUMN repo TEXT NOT NULL DEFAULT 'legacy'`);
-    // kv needs composite PK (key, repo) — recreate the table
-    db.exec(`
-      CREATE TABLE kv_v2 (
-        key TEXT NOT NULL,
-        repo TEXT NOT NULL DEFAULT 'legacy',
-        value TEXT NOT NULL,
-        set_by TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (key, repo)
-      );
-      INSERT INTO kv_v2 SELECT key, 'legacy', value, set_by, updated_at FROM kv;
-      DROP TABLE kv;
-      ALTER TABLE kv_v2 RENAME TO kv;
-    `);
-  });
+    const migrate3 = db.transaction(() => {
+      const instanceCols = db.pragma("table_info(instances)") as Array<{ name: string }>;
+      const hasSlot = instanceCols.some((c) => c.name === "slot");
+      if (!hasSlot) {
+        db.exec(`ALTER TABLE instances ADD COLUMN slot INTEGER`);
+        db.exec(`UPDATE instances SET slot = rowid WHERE slot IS NULL`);
+      }
 
-  migrate();
-  db.pragma("user_version = 2");
+      const msgCols = db.pragma("table_info(messages)") as Array<{ name: string }>;
+      const hasToInstanceId = msgCols.some((c) => c.name === "to_instance_id");
+      if (!hasToInstanceId) {
+        db.exec(`ALTER TABLE messages ADD COLUMN to_instance_id TEXT`);
+      }
+    });
 
-  process.stderr.write(
-    "claude-squad: migration complete. Existing data tagged as repo='legacy'.\n"
-  );
+    migrate3();
+    db.pragma("user_version = 3");
+
+    process.stderr.write("claude-squad: v3 migration complete.\n");
+  }
 }
 
-/** Creates the repo-scoped index — only safe to call after migration ensures the column exists. */
-function ensureRepoIndex(db: Database.Database): void {
-  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_repo ON messages(repo, created_at DESC)");
+/** Creates all indexes — only safe to call after migration ensures the columns exist. */
+function ensureIndexes(db: Database.Database): void {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_repo ON messages(repo, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_instances_slot ON instances(slot);
+    CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);
+  `);
 }
 
 function purgeStaleInstances(db: Database.Database): void {
@@ -135,8 +163,8 @@ export function upsertInstance(
   repo = "local"
 ): void {
   db.prepare(`
-    INSERT INTO instances (id, name, cwd, branch, repo, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO instances (id, name, cwd, branch, repo, slot, last_seen)
+    VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(slot), 0) + 1 FROM instances), ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       cwd = excluded.cwd,
@@ -170,12 +198,12 @@ export function listInstances(db: Database.Database, repo?: string): Instance[] 
   if (repo !== undefined) {
     return db
       .prepare(
-        "SELECT * FROM instances WHERE (last_seen > ? OR last_seen = 0) AND repo = ? ORDER BY last_seen DESC"
+        "SELECT * FROM instances WHERE (last_seen > ? OR last_seen = 0) AND last_seen != 0 AND repo = ? ORDER BY slot ASC"
       )
       .all(cutoff, repo) as Instance[];
   }
   return db
-    .prepare("SELECT * FROM instances WHERE last_seen > ? OR last_seen = 0 ORDER BY last_seen DESC")
+    .prepare("SELECT * FROM instances WHERE (last_seen > ? OR last_seen = 0) AND last_seen != 0 ORDER BY slot ASC")
     .all(cutoff) as Instance[];
 }
 
@@ -197,6 +225,48 @@ export function getInstanceRepo(db: Database.Database, instanceId: string): stri
     .prepare("SELECT repo FROM instances WHERE id = ?")
     .get(instanceId) as { repo: string } | undefined;
   return row?.repo ?? "local";
+}
+
+/**
+ * Resolve a target (slot number or name string) to an active instance.
+ * Returns { instance } on success or { error } on failure.
+ * typeof number → slot lookup; typeof string → exact name match.
+ * String digits (e.g. '1') go to name lookup, NOT slot lookup.
+ */
+export function getInstanceBySlotOrName(
+  db: Database.Database,
+  target: number | string,
+  repo: string
+): { instance: Instance } | { error: string } {
+  const cutoff = nowMs() - STALE_INSTANCE_MS;
+
+  if (typeof target === "number") {
+    const row = db
+      .prepare(
+        "SELECT * FROM instances WHERE slot = ? AND repo = ? AND last_seen > 0 AND last_seen >= ?"
+      )
+      .get(target, repo, cutoff) as Instance | undefined;
+    if (!row) {
+      return { error: `No instance with slot #${target}. Call list_instances().` };
+    }
+    return { instance: row };
+  }
+
+  // String: exact name match
+  const rows = db
+    .prepare(
+      "SELECT * FROM instances WHERE name = ? AND repo = ? AND last_seen > 0 AND last_seen >= ?"
+    )
+    .all(target, repo, cutoff) as Instance[];
+
+  if (rows.length === 0) {
+    return { error: `No active instance named '${target}'. Call list_instances().` };
+  }
+  if (rows.length > 1) {
+    const list = rows.map((r) => `#${r.slot} ${r.name}@${r.branch ?? "detached"}`).join(", ");
+    return { error: `Name '${target}' matches ${list}. Use slot number.` };
+  }
+  return { instance: rows[0] };
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -239,6 +309,26 @@ export function ask(
   return result.lastInsertRowid as number;
 }
 
+export function askInstance(
+  db: Database.Database,
+  fromInstanceId: string,
+  toInstanceId: string,
+  question: string,
+  context?: string,
+  repo?: string
+): number {
+  const content = context ? `${question}\n\nContext: ${context}` : question;
+  if (Buffer.byteLength(content, "utf8") > MAX_BROADCAST_BYTES) {
+    throw new Error(`Question too large (max ${MAX_BROADCAST_BYTES / 1024}KB)`);
+  }
+  const effectiveRepo = repo ?? getInstanceRepo(db, fromInstanceId);
+  const result = db.prepare(`
+    INSERT INTO messages (instance_id, type, content, tags, reply_to, repo, to_instance_id, created_at)
+    VALUES (?, 'ask', ?, NULL, NULL, ?, ?, ?)
+  `).run(fromInstanceId, content, effectiveRepo, toInstanceId, nowMs());
+  return result.lastInsertRowid as number;
+}
+
 export function answer(
   db: Database.Database,
   instanceId: string,
@@ -255,6 +345,15 @@ export function answer(
   if (target.type !== "ask") {
     throw new Error(`Message ${questionId} is not a question (type: ${target.type})`);
   }
+
+  // Double-answer guard
+  const existing = db.prepare(
+    "SELECT id FROM messages WHERE reply_to = ? AND type = 'answer'"
+  ).get(questionId) as { id: number } | undefined;
+  if (existing) {
+    throw new Error(`Question #${questionId} already has an answer (id: ${existing.id})`);
+  }
+
   if (Buffer.byteLength(answerText, "utf8") > MAX_BROADCAST_BYTES) {
     throw new Error(`Answer too large (max ${MAX_BROADCAST_BYTES / 1024}KB)`);
   }
@@ -271,14 +370,16 @@ export function readMessages(
   since?: number,
   tags?: string[],
   limit?: number,
-  repo?: string
+  repo?: string,
+  replyToId?: number
 ): Message[] {
   const effectiveLimit = Math.min(limit ?? DEFAULT_MESSAGES_LIMIT, MAX_MESSAGES_LIMIT);
 
   let query = `
-    SELECT m.*, i.name AS instance_name
+    SELECT m.*, i.name AS instance_name, t.name AS to_instance_name
     FROM messages m
     LEFT JOIN instances i ON m.instance_id = i.id
+    LEFT JOIN instances t ON m.to_instance_id = t.id
   `;
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -291,6 +392,11 @@ export function readMessages(
   if (since !== undefined) {
     conditions.push("m.created_at > ?");
     params.push(since);
+  }
+
+  if (replyToId !== undefined) {
+    conditions.push("m.reply_to = ?");
+    params.push(replyToId);
   }
 
   // SQL tag filter via json_each — LIMIT applies after filtering
@@ -312,6 +418,38 @@ export function readMessages(
   params.push(effectiveLimit);
 
   const rows = db.prepare(query).all(...params) as Array<Message & { tags: string | null }>;
+
+  return rows.map((r) => ({
+    ...r,
+    tags: r.tags ? (JSON.parse(r.tags) as string[]) : null,
+  }));
+}
+
+/**
+ * Returns unanswered directed questions for the given instance.
+ * Excludes questions from dead/stale senders.
+ */
+export function checkInbox(
+  db: Database.Database,
+  instanceId: string,
+  limit = 10
+): Message[] {
+  const effectiveLimit = Math.min(limit, 20);
+  const cutoff = nowMs() - STALE_INSTANCE_MS;
+
+  const rows = db.prepare(`
+    SELECT m.*, i.name AS instance_name
+    FROM messages m
+    LEFT JOIN messages a ON a.reply_to = m.id AND a.type = 'answer'
+    JOIN instances i ON i.id = m.instance_id
+    WHERE m.to_instance_id = ?
+      AND m.type = 'ask'
+      AND a.id IS NULL
+      AND i.last_seen > 0
+      AND i.last_seen >= ?
+    ORDER BY m.created_at DESC
+    LIMIT ?
+  `).all(instanceId, cutoff, effectiveLimit) as Array<Message & { tags: string | null }>;
 
   return rows.map((r) => ({
     ...r,
@@ -355,7 +493,7 @@ export function getShared(
 
 // ── Standup ───────────────────────────────────────────────────────────────────
 
-export function buildStandup(db: Database.Database, repo?: string): Standup {
+export function buildStandup(db: Database.Database, repo?: string, instanceId?: string): Standup {
   const active = getActiveInstances(db, repo);
 
   let msgQuery = `
@@ -377,6 +515,16 @@ export function buildStandup(db: Database.Database, repo?: string): Standup {
     instance_name: string;
   }>;
 
+  let inboxCount = 0;
+  if (instanceId) {
+    try {
+      const pending = checkInbox(db, instanceId, 20);
+      inboxCount = pending.length;
+    } catch (err) {
+      process.stderr.write(`claude-squad: buildStandup inbox count error: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  }
+
   return {
     active_instances: active.map((i) => ({
       name: i.name,
@@ -390,6 +538,7 @@ export function buildStandup(db: Database.Database, repo?: string): Standup {
       content: r.content.slice(0, 200),
       created_at: r.created_at,
     })),
+    inbox_count: inboxCount,
   };
 }
 

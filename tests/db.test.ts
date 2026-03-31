@@ -12,11 +12,14 @@ import {
   getActiveInstances,
   broadcast,
   ask,
+  askInstance,
   answer,
   readMessages,
   setShared,
   getShared,
   buildStandup,
+  checkInbox,
+  getInstanceBySlotOrName,
   pruneOldMessages,
   getRecentMessageCount,
 } from "../src/db.js";
@@ -71,10 +74,10 @@ describe("openDb", () => {
     fs.unlinkSync(dbPath);
   });
 
-  it("fresh db is schema version 2", () => {
+  it("fresh db is schema version 3", () => {
     const dbPath = tempDbPath();
     const db = openDb(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(2);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
     db.close();
     fs.unlinkSync(dbPath);
   });
@@ -117,8 +120,8 @@ describe("schema migration v1 → v2", () => {
     // Open with our openDb — should migrate
     const db = openDb(dbPath);
 
-    // Schema version bumped
-    expect(db.pragma("user_version", { simple: true })).toBe(2);
+    // Schema version bumped (v1→v2→v3)
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
 
     // instances has repo column, existing row tagged 'legacy'
     const inst = db.prepare("SELECT repo FROM instances WHERE id = 'i1'").get() as { repo: string };
@@ -136,13 +139,13 @@ describe("schema migration v1 → v2", () => {
     fs.unlinkSync(dbPath);
   });
 
-  it("migration is idempotent — v2 db does not re-migrate", () => {
+  it("migration is idempotent — db does not re-migrate on second open", () => {
     const dbPath = tempDbPath();
     const db1 = openDb(dbPath);
     db1.close();
     // Second open should not throw
     const db2 = openDb(dbPath);
-    expect(db2.pragma("user_version", { simple: true })).toBe(2);
+    expect(db2.pragma("user_version", { simple: true })).toBe(3);
     db2.close();
     fs.unlinkSync(dbPath);
   });
@@ -563,5 +566,395 @@ describe("pruneOldMessages", () => {
     pruneOldMessages(db);
     const msgs = readMessages(db, undefined, undefined, 20);
     expect(msgs).toHaveLength(1);
+  });
+});
+
+describe("upsertInstance slot assignment", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("first instance gets slot 1", () => {
+    upsertInstance(db, "i1", "alpha", "/a", null, REPO_A);
+    const inst = db.prepare("SELECT slot FROM instances WHERE id = 'i1'").get() as { slot: number };
+    expect(inst.slot).toBe(1);
+  });
+
+  it("second instance gets slot 2", () => {
+    upsertInstance(db, "i1", "alpha", "/a", null, REPO_A);
+    upsertInstance(db, "i2", "beta", "/b", null, REPO_A);
+    const inst = db.prepare("SELECT slot FROM instances WHERE id = 'i2'").get() as { slot: number };
+    expect(inst.slot).toBe(2);
+  });
+
+  it("re-registering the same instance does NOT change slot", () => {
+    upsertInstance(db, "i1", "alpha", "/a", null, REPO_A);
+    const before = db.prepare("SELECT slot FROM instances WHERE id = 'i1'").get() as { slot: number };
+    upsertInstance(db, "i1", "alpha", "/a", "new-branch", REPO_A);
+    const after = db.prepare("SELECT slot FROM instances WHERE id = 'i1'").get() as { slot: number };
+    expect(after.slot).toBe(before.slot);
+  });
+
+  it("two instances in different repos get independent slots starting from 1 per-global-table", () => {
+    upsertInstance(db, "i1", "worker", "/a", null, REPO_A);
+    upsertInstance(db, "i2", "worker", "/b", null, "repo-B");
+    const s1 = db.prepare("SELECT slot FROM instances WHERE id = 'i1'").get() as { slot: number };
+    const s2 = db.prepare("SELECT slot FROM instances WHERE id = 'i2'").get() as { slot: number };
+    expect(s1.slot).toBe(1);
+    expect(s2.slot).toBe(2);
+  });
+});
+
+describe("schema v3 migration", () => {
+  it("instances table has slot column after v3 migration", () => {
+    const dbPath = tempDbPath();
+    const db = openDb(dbPath);
+    const cols = db.pragma("table_info(instances)") as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === "slot")).toBe(true);
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("messages table has to_instance_id column after v3 migration", () => {
+    const dbPath = tempDbPath();
+    const db = openDb(dbPath);
+    const cols = db.pragma("table_info(messages)") as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === "to_instance_id")).toBe(true);
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("idx_instances_slot index exists", () => {
+    const dbPath = tempDbPath();
+    const db = openDb(dbPath);
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_instances_slot'").get();
+    expect(idx).toBeTruthy();
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("idx_messages_reply_to index exists", () => {
+    const dbPath = tempDbPath();
+    const db = openDb(dbPath);
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_reply_to'").get();
+    expect(idx).toBeTruthy();
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("migrates v2 db to v3 adding slot backfill", () => {
+    const dbPath = tempDbPath();
+    // Create a v2-level DB: has repo columns but no slot
+    const v2 = new Database(dbPath);
+    v2.exec(`
+      CREATE TABLE instances (id TEXT PRIMARY KEY, name TEXT NOT NULL, cwd TEXT NOT NULL, branch TEXT, repo TEXT NOT NULL DEFAULT 'local', last_seen INTEGER NOT NULL);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, type TEXT NOT NULL, content TEXT NOT NULL, tags TEXT, reply_to INTEGER, repo TEXT NOT NULL DEFAULT 'local', to_instance_id TEXT, created_at INTEGER NOT NULL);
+      CREATE TABLE kv (key TEXT NOT NULL, repo TEXT NOT NULL DEFAULT 'local', value TEXT NOT NULL, set_by TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (key, repo));
+    `);
+    v2.prepare("INSERT INTO instances (id, name, cwd, repo, last_seen) VALUES (?, ?, ?, ?, ?)").run("i1", "Alpha", "/proj", "local", nowMs());
+    v2.pragma("user_version = 2");
+    v2.close();
+
+    const db = openDb(dbPath);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
+    const inst = db.prepare("SELECT slot FROM instances WHERE id = 'i1'").get() as { slot: number };
+    expect(inst.slot).toBeGreaterThan(0);
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+});
+
+describe("getInstanceBySlotOrName", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "i1", "backend", "/b", "main", REPO_A);
+    upsertInstance(db, "i2", "frontend", "/f", "main", REPO_A);
+    upsertInstance(db, "i3", "ambiguous", "/x", "feat-a", REPO_A);
+    upsertInstance(db, "i4", "ambiguous", "/y", "feat-b", REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("resolves by slot number", () => {
+    const s1 = db.prepare("SELECT slot FROM instances WHERE id='i1'").get() as { slot: number };
+    const result = getInstanceBySlotOrName(db, s1.slot, REPO_A);
+    expect("instance" in result).toBe(true);
+    if ("instance" in result) expect(result.instance.id).toBe("i1");
+  });
+
+  it("returns error for unknown slot", () => {
+    const result = getInstanceBySlotOrName(db, 999, REPO_A);
+    expect("error" in result).toBe(true);
+    if ("error" in result) expect(result.error).toMatch(/slot #999/);
+  });
+
+  it("resolves by exact name", () => {
+    const result = getInstanceBySlotOrName(db, "backend", REPO_A);
+    expect("instance" in result).toBe(true);
+    if ("instance" in result) expect(result.instance.id).toBe("i1");
+  });
+
+  it("returns error for unknown name", () => {
+    const result = getInstanceBySlotOrName(db, "nonexistent", REPO_A);
+    expect("error" in result).toBe(true);
+    if ("error" in result) expect(result.error).toMatch(/No active instance named/);
+  });
+
+  it("returns error listing matches when name is ambiguous", () => {
+    const result = getInstanceBySlotOrName(db, "ambiguous", REPO_A);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error).toMatch(/matches/);
+      expect(result.error).toMatch(/Use slot number/);
+    }
+  });
+
+  it("offline instance excluded from slot lookup", () => {
+    markOffline(db, "i1");
+    const s1 = db.prepare("SELECT slot FROM instances WHERE id='i1'").get() as { slot: number };
+    const result = getInstanceBySlotOrName(db, s1.slot, REPO_A);
+    expect("error" in result).toBe(true);
+  });
+
+  it("offline instance excluded from name lookup", () => {
+    markOffline(db, "i1");
+    const result = getInstanceBySlotOrName(db, "backend", REPO_A);
+    expect("error" in result).toBe(true);
+  });
+
+  it("string digit goes to name lookup not slot", () => {
+    const s1 = db.prepare("SELECT slot FROM instances WHERE id='i1'").get() as { slot: number };
+    // "1" as string → name lookup, not slot
+    const result = getInstanceBySlotOrName(db, String(s1.slot), REPO_A);
+    // No instance named "1" (or whatever slot number), should error
+    expect("error" in result).toBe(true);
+    if ("error" in result) expect(result.error).toMatch(/No active instance named/);
+  });
+});
+
+describe("askInstance", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "sender", "alpha", "/a", null, REPO_A);
+    upsertInstance(db, "target", "beta", "/b", null, REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("returns message id", () => {
+    const id = askInstance(db, "sender", "target", "what port?");
+    expect(typeof id).toBe("number");
+    expect(id).toBeGreaterThan(0);
+  });
+
+  it("stores to_instance_id correctly", () => {
+    const id = askInstance(db, "sender", "target", "ping?");
+    const row = db.prepare("SELECT to_instance_id FROM messages WHERE id = ?").get(id) as { to_instance_id: string };
+    expect(row.to_instance_id).toBe("target");
+  });
+
+  it("stores question content correctly", () => {
+    const id = askInstance(db, "sender", "target", "what branch?");
+    const row = db.prepare("SELECT content FROM messages WHERE id = ?").get(id) as { content: string };
+    expect(row.content).toBe("what branch?");
+  });
+
+  it("appends context when provided", () => {
+    const id = askInstance(db, "sender", "target", "what schema?", "check db.ts");
+    const row = db.prepare("SELECT content FROM messages WHERE id = ?").get(id) as { content: string };
+    expect(row.content).toBe("what schema?\n\nContext: check db.ts");
+  });
+
+  it("scopes to repo correctly", () => {
+    const id = askInstance(db, "sender", "target", "q", undefined, REPO_A);
+    const row = db.prepare("SELECT repo FROM messages WHERE id = ?").get(id) as { repo: string };
+    expect(row.repo).toBe(REPO_A);
+  });
+});
+
+describe("checkInbox", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "asker", "asker", "/a", null, REPO_A);
+    upsertInstance(db, "responder", "responder", "/r", null, REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("returns unanswered directed questions for caller", () => {
+    askInstance(db, "asker", "responder", "q1");
+    const inbox = checkInbox(db, "responder");
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].content).toBe("q1");
+  });
+
+  it("excludes answered questions", () => {
+    const qId = askInstance(db, "asker", "responder", "q1");
+    answer(db, "responder", qId, "the answer");
+    const inbox = checkInbox(db, "responder");
+    expect(inbox).toHaveLength(0);
+  });
+
+  it("returns empty array when no pending questions", () => {
+    const inbox = checkInbox(db, "responder");
+    expect(inbox).toHaveLength(0);
+  });
+
+  it("respects default limit of 10", () => {
+    for (let i = 0; i < 15; i++) {
+      askInstance(db, "asker", "responder", `q${i}`);
+    }
+    const inbox = checkInbox(db, "responder");
+    expect(inbox).toHaveLength(10);
+  });
+
+  it("caps at max 20 even when limit=50 passed", () => {
+    for (let i = 0; i < 25; i++) {
+      askInstance(db, "asker", "responder", `q${i}`);
+    }
+    const inbox = checkInbox(db, "responder", 50);
+    expect(inbox.length).toBeLessThanOrEqual(20);
+  });
+
+  it("excludes questions from dead (offline) senders", () => {
+    askInstance(db, "asker", "responder", "q-from-alive");
+    markOffline(db, "asker");
+    const inbox = checkInbox(db, "responder");
+    expect(inbox).toHaveLength(0);
+  });
+});
+
+describe("readMessages reply_to_id filter", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "i1", "alpha", "/a", null, REPO_A);
+    upsertInstance(db, "i2", "beta", "/b", null, REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("returns only the answer for a given question id", () => {
+    const qId = ask(db, "i1", "question?", undefined, REPO_A);
+    answer(db, "i2", qId, "the answer");
+    broadcast(db, "i1", "unrelated broadcast", undefined, REPO_A);
+
+    const msgs = readMessages(db, undefined, undefined, 20, REPO_A, qId);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe("the answer");
+    expect(msgs[0].reply_to).toBe(qId);
+  });
+
+  it("returns empty when no answer yet", () => {
+    const qId = ask(db, "i1", "question?", undefined, REPO_A);
+    const msgs = readMessages(db, undefined, undefined, 20, REPO_A, qId);
+    expect(msgs).toHaveLength(0);
+  });
+});
+
+describe("answer double-answer guard", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "i1", "alpha", "/a", null, REPO_A);
+    upsertInstance(db, "i2", "beta", "/b", null, REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("first answer succeeds", () => {
+    const qId = ask(db, "i1", "q?", undefined, REPO_A);
+    expect(() => answer(db, "i2", qId, "first")).not.toThrow();
+  });
+
+  it("second answer to same question throws", () => {
+    const qId = ask(db, "i1", "q?", undefined, REPO_A);
+    answer(db, "i2", qId, "first");
+    expect(() => answer(db, "i2", qId, "second")).toThrow(/already has an answer/);
+  });
+});
+
+describe("buildStandup inbox count", () => {
+  let db: Database.Database;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = tempDbPath();
+    db = openDb(dbPath);
+    upsertInstance(db, "me", "me", "/me", null, REPO_A);
+    upsertInstance(db, "other", "other", "/other", null, REPO_A);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it("inbox_count is 0 when no directed questions", () => {
+    const standup = buildStandup(db, REPO_A, "me");
+    expect(standup.inbox_count).toBe(0);
+  });
+
+  it("inbox_count reflects unanswered directed questions", () => {
+    askInstance(db, "other", "me", "q1");
+    askInstance(db, "other", "me", "q2");
+    const standup = buildStandup(db, REPO_A, "me");
+    expect(standup.inbox_count).toBe(2);
+  });
+
+  it("answered questions not counted in inbox", () => {
+    const qId = askInstance(db, "other", "me", "q1");
+    answer(db, "me", qId, "done");
+    const standup = buildStandup(db, REPO_A, "me");
+    expect(standup.inbox_count).toBe(0);
+  });
+
+  it("standup returns without crashing when instanceId not provided", () => {
+    askInstance(db, "other", "me", "q1");
+    expect(() => buildStandup(db, REPO_A)).not.toThrow();
+    const standup = buildStandup(db, REPO_A);
+    expect(standup.inbox_count).toBe(0);
   });
 });

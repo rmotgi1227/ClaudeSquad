@@ -28,17 +28,20 @@ export interface Instance {
   cwd: string;
   branch: string | null;
   repo: string;
+  slot: number | null;
   last_seen: number; // millisecond epoch
 }
 
 export interface Message {
   id: number;
   instance_id: string;
-  instance_name?: string; // joined
+  instance_name?: string;    // joined from instances
+  to_instance_name?: string; // joined from instances via to_instance_id
   type: "broadcast" | "ask" | "answer";
   content: string;
   tags: string[] | null;
   reply_to: number | null;
+  to_instance_id: string | null; // directed ask — null means public
   created_at: number; // millisecond epoch
 }
 
@@ -53,6 +56,7 @@ export interface KVEntry {
 export interface Standup {
   active_instances: Array<{ name: string; branch: string | null; cwd: string; last_seen: number }>;
   recent_messages: Array<{ from: string; type: string; content: string; created_at: number }>;
+  inbox_count: number;
 }
 
 // Daemon RPC protocol (NDJSON over Unix socket)
@@ -89,12 +93,26 @@ export interface ReadMessagesParams {
   tags?: string[];
   limit?: number;
   repo?: string;
+  reply_to_id?: number;
 }
 
 export interface AskParams {
   instance_id: string;
   question: string;
   context?: string;
+}
+
+export interface AskInstanceParams {
+  instance_id: string;
+  target: number | string;
+  question: string;
+  context?: string;
+  repo: string;
+}
+
+export interface CheckInboxParams {
+  instance_id: string;
+  limit?: number;
 }
 
 export interface AnswerParams {

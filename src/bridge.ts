@@ -48,7 +48,10 @@ async function register(): Promise<string> {
     startup_ts: STARTUP_TS,
   }) as { instance_id: string; standup: Standup };
 
-  const { active_instances } = result.standup ?? {};
+  const { active_instances, inbox_count } = result.standup ?? {};
+
+  const notices: string[] = [];
+
   if (active_instances?.length) {
     const others = active_instances.filter(
       (i) => i.name !== INSTANCE_NAME || i.cwd !== CWD
@@ -57,15 +60,23 @@ async function register(): Promise<string> {
       const names = others
         .map((i) => `${i.name}${i.branch ? `@${i.branch}` : ""} (${formatAge(i.last_seen)})`)
         .join(", ");
-      pendingStandup = `[Squad: ${others.length} instance${others.length > 1 ? "s" : ""} active — ${names}. Call read_messages to catch up.]`;
+      notices.push(`[Squad: ${others.length} instance${others.length > 1 ? "s" : ""} active — ${names}. Call read_messages to catch up.]`);
     }
+  }
+
+  if (inbox_count && inbox_count > 0) {
+    notices.push(`[${inbox_count} question${inbox_count > 1 ? "s" : ""} waiting for you — call check_inbox() to review.]`);
+  }
+
+  if (notices.length > 0) {
+    pendingStandup = notices.join(" ");
   }
 
   return result.instance_id;
 }
 
 const server = new Server(
-  { name: "ccsquad", version: "1.1.0" },
+  { name: "ccsquad", version: "1.2.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -116,6 +127,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "ask_instance",
+      description: "Ask a specific instance a directed question. Use list_instances() first to get slot numbers. The question is visible to all but delivered to the target.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: {
+            description: "Slot number (e.g. 2) or exact instance name (e.g. 'backend'). Use slot number when names are ambiguous.",
+            oneOf: [
+              { type: "number" },
+              { type: "string" },
+            ],
+          },
+          question: { type: "string", description: "The question to ask" },
+          context: { type: "string", description: "Optional context to help the target answer" },
+          wait: { type: "boolean", description: "If true, wait up to wait_timeout_ms for an answer before returning (default false)" },
+          wait_timeout_ms: { type: "number", description: "How long to wait for an answer in ms (default 30000). Useful for tests." },
+        },
+        required: ["target", "question"],
+      },
+    },
+    {
+      name: "check_inbox",
+      description: "See unanswered questions directed specifically at you. Use answer() to respond.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "answer",
       description: "Respond to a question posted by another instance.",
       inputSchema: {
@@ -129,7 +169,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_instances",
-      description: "See all active Claude Code instances on this machine — their names, branches, and last activity.",
+      description: "See all active Claude Code instances on this machine — their slot numbers, names, branches, and last activity.",
       inputSchema: { type: "object", properties: {} },
     },
     {
@@ -188,11 +228,21 @@ async function handleTool(
         }
         const formatted = msgs
           .map((m: unknown) => {
-            const msg = m as { instance_name?: string; type: string; content: string; created_at: number; id: number; tags?: string[] };
+            const msg = m as {
+              instance_name?: string;
+              to_instance_name?: string;
+              type: string;
+              content: string;
+              created_at: number;
+              id: number;
+              tags?: string[];
+              to_instance_id?: string | null;
+            };
             const age = formatAge(msg.created_at);
             const tag = msg.tags?.length ? ` [${msg.tags.join(", ")}]` : "";
+            const directed = msg.to_instance_id && msg.to_instance_name ? ` → @${msg.to_instance_name}` : "";
             const prefix = msg.type === "ask" ? `Q#${msg.id}` : msg.type === "answer" ? "A" : "→";
-            return `${prefix} ${msg.instance_name || "unknown"} (${age})${tag}: ${msg.content}`;
+            return `${prefix} ${msg.instance_name || "unknown"}${directed} (${age})${tag}: ${msg.content}`;
           })
           .join("\n");
         return { content: [{ type: "text", text: formatted }] };
@@ -207,6 +257,86 @@ async function handleTool(
         return {
           content: [{ type: "text", text: `Question posted (id: ${result.message_id}). Others can answer it with answer(question_id: ${result.message_id}, answer: "...")` }],
         };
+      }
+
+      case "ask_instance": {
+        const wait = args.wait as boolean | undefined;
+        const waitTimeoutMs = (args.wait_timeout_ms as number | undefined) ?? 30000;
+
+        const result = await daemonRpc("ask_instance", {
+          instance_id: instanceId,
+          target: args.target,
+          question: args.question as string,
+          context: args.context as string | undefined,
+          repo: instanceRepo,
+        }) as {
+          message_id: number;
+          question_id: number;
+          target_name: string;
+          target_last_seen: number;
+          stale_warning: string | null;
+        };
+
+        const questionId = result.question_id;
+        let text = `Question posted to @${result.target_name} (id: ${questionId}).`;
+        if (result.stale_warning) {
+          text += ` Warning: ${result.stale_warning}`;
+        }
+
+        if (!wait) {
+          return { content: [{ type: "text", text }] };
+        }
+
+        // wait=true: poll for answer every 2s
+        const pollIntervalMs = 2000;
+        const deadline = nowMs() + waitTimeoutMs;
+
+        while (nowMs() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          const pollResult = await daemonRpc("read_messages", {
+            repo: instanceRepo,
+            reply_to_id: questionId,
+            limit: 1,
+          }) as { messages: unknown[] };
+
+          if (pollResult.messages.length > 0) {
+            const answer = pollResult.messages[0] as { instance_name?: string; content: string };
+            return {
+              content: [{
+                type: "text",
+                text: `Answer from @${answer.instance_name || "unknown"}: ${answer.content}`,
+              }],
+            };
+          }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: `No answer in ${Math.round(waitTimeoutMs / 1000)}s. Question still open (id: ${questionId}).`,
+          }],
+        };
+      }
+
+      case "check_inbox": {
+        const result = await daemonRpc("check_inbox", {
+          instance_id: instanceId,
+        }) as { questions: unknown[] };
+
+        const questions = result.questions;
+        if (questions.length === 0) {
+          return { content: [{ type: "text", text: "No pending questions." }] };
+        }
+
+        const formatted = questions
+          .map((q: unknown) => {
+            const msg = q as { id: number; instance_name?: string; content: string; created_at: number };
+            const age = formatAge(msg.created_at);
+            return `Q#${msg.id} ${msg.instance_name || "unknown"} (${age}): ${msg.content}`;
+          })
+          .join("\n");
+
+        return { content: [{ type: "text", text: formatted }] };
       }
 
       case "answer": {
@@ -228,11 +358,12 @@ async function handleTool(
         }
         const formatted = instances
           .map((inst: unknown) => {
-            const i = inst as { name: string; branch?: string; cwd: string; last_seen: number; id: string };
+            const i = inst as { name: string; branch?: string; cwd: string; last_seen: number; id: string; slot: number | null };
             const me = i.id === instanceId ? " (you)" : "";
             const branch = i.branch ? `@${i.branch}` : "";
             const age = i.last_seen === 0 ? "offline" : formatAge(i.last_seen);
-            return `• ${i.name}${branch}${me} — ${path.basename(i.cwd)} (${age})`;
+            const slot = i.slot != null ? `#${i.slot} ` : "";
+            return `• ${slot}${i.name}${branch}${me} — ${path.basename(i.cwd)} (${age})`;
           })
           .join("\n");
         return { content: [{ type: "text", text: formatted }] };

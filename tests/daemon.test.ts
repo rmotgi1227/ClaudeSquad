@@ -63,9 +63,10 @@ async function startTestDaemon(): Promise<{ socketPath: string; dbPath: string; 
   const { default: Database } = await import("better-sqlite3");
   const {
     upsertInstance, heartbeat, markOffline, listInstances,
-    broadcast, ask, answer, readMessages, setShared, getShared, buildStandup,
+    broadcast, ask, askInstance, answer, readMessages, setShared, getShared, buildStandup,
+    checkInbox, getInstanceBySlotOrName,
   } = await import("../src/db.js");
-  const { makeInstanceId } = await import("../src/types.js");
+  const { makeInstanceId, STALE_INSTANCE_MS, nowMs } = await import("../src/types.js");
 
   function handleRequest(req: { id: string; method: string; params: Record<string, unknown> }): unknown {
     switch (req.method) {
@@ -74,7 +75,7 @@ async function startTestDaemon(): Promise<{ socketPath: string; dbPath: string; 
         const p = req.params as { name: string; cwd: string; branch?: string; repo?: string; pid: number; startup_ts: number };
         const id = makeInstanceId(p.name, p.cwd, p.pid, p.startup_ts);
         upsertInstance(db, id, p.name, p.cwd, p.branch ?? null, p.repo ?? "local");
-        return { instance_id: id, standup: buildStandup(db, p.repo) };
+        return { instance_id: id, standup: buildStandup(db, p.repo, id) };
       }
       case "heartbeat": {
         const p = req.params as { instance_id: string; branch?: string };
@@ -90,19 +91,40 @@ async function startTestDaemon(): Promise<{ socketPath: string; dbPath: string; 
         return { message_id: broadcast(db, p.instance_id, p.content, p.tags) };
       }
       case "read_messages": {
-        const p = req.params as { since?: number; tags?: string[]; limit?: number };
-        return { messages: readMessages(db, p.since, p.tags, p.limit) };
+        const p = req.params as { since?: number; tags?: string[]; limit?: number; repo?: string; reply_to_id?: number };
+        return { messages: readMessages(db, p.since, p.tags, p.limit, p.repo, p.reply_to_id) };
       }
       case "ask": {
         const p = req.params as { instance_id: string; question: string; context?: string };
         return { message_id: ask(db, p.instance_id, p.question, p.context) };
+      }
+      case "ask_instance": {
+        const p = req.params as { instance_id: string; target: number | string; question: string; context?: string; repo: string };
+        const resolved = getInstanceBySlotOrName(db, p.target, p.repo);
+        if ("error" in resolved) throw new Error(resolved.error);
+        const target = resolved.instance;
+        const id = askInstance(db, p.instance_id, target.id, p.question, p.context, p.repo);
+        const staleCutoff = nowMs() - STALE_INSTANCE_MS;
+        const isStale = target.last_seen > 0 && target.last_seen < staleCutoff + (STALE_INSTANCE_MS * 0.5);
+        return {
+          message_id: id,
+          question_id: id,
+          target_name: target.name,
+          target_last_seen: target.last_seen,
+          stale_warning: isStale ? `Target last seen ${Math.floor((nowMs() - target.last_seen) / 60000)}m ago.` : null,
+        };
+      }
+      case "check_inbox": {
+        const p = req.params as { instance_id: string; limit?: number };
+        return { questions: checkInbox(db, p.instance_id, p.limit) };
       }
       case "answer": {
         const p = req.params as { instance_id: string; question_id: number; answer: string };
         return { message_id: answer(db, p.instance_id, p.question_id, p.answer) };
       }
       case "list_instances": {
-        return { instances: listInstances(db) };
+        const p = req.params as { repo?: string };
+        return { instances: listInstances(db, p.repo) };
       }
       case "set_shared": {
         const p = req.params as { instance_id: string; key: string; value: string };
@@ -348,13 +370,180 @@ describe("heartbeat and stale detection", () => {
     expect(after.branch).toBe("new-branch");
   });
 
-  it("mark_offline makes instance show last_seen=0", async () => {
+  it("mark_offline removes instance from list_instances", async () => {
     const { instance_id } = await rpc(socket, "register", {
       name: "A", cwd: "/proj", pid: 1, startup_ts: 1,
     }) as { instance_id: string };
 
+    const before = (await rpc(socket, "list_instances", {}) as { instances: unknown[] }).instances;
+    expect(before.length).toBe(1);
+
     await rpc(socket, "mark_offline", { instance_id });
-    const { instances } = await rpc(socket, "list_instances", {}) as { instances: Array<{ last_seen: number }> };
-    expect(instances[0].last_seen).toBe(0);
+    const { instances } = await rpc(socket, "list_instances", {}) as { instances: unknown[] };
+    expect(instances.length).toBe(0);
+  });
+});
+
+describe("ask_instance RPC", () => {
+  let daemon: Awaited<ReturnType<typeof startTestDaemon>>;
+  let socket: net.Socket;
+
+  beforeEach(async () => {
+    daemon = await startTestDaemon();
+    socket = net.createConnection(daemon.socketPath);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+  });
+
+  afterEach(async () => {
+    socket.destroy();
+    await daemon.stop();
+  });
+
+  async function registerInstance(name: string, repo = "test-repo"): Promise<string> {
+    const result = await rpc(socket, "register", {
+      name, cwd: `/${name}`, pid: Math.floor(Math.random() * 10000), startup_ts: Date.now(), repo,
+    }) as { instance_id: string };
+    return result.instance_id;
+  }
+
+  it("ask_instance with valid slot posts message and returns question_id", async () => {
+    const callerId = await registerInstance("caller");
+    await registerInstance("target");
+    const { instances } = await rpc(socket, "list_instances", { repo: "test-repo" }) as { instances: Array<{ slot: number; name: string; id: string }> };
+    const targetSlot = instances.find((i) => i.name === "target")!.slot;
+
+    const result = await rpc(socket, "ask_instance", {
+      instance_id: callerId, target: targetSlot, question: "what port?", repo: "test-repo",
+    }) as { message_id: number; question_id: number; target_name: string };
+
+    expect(result.question_id).toBeGreaterThan(0);
+    expect(result.target_name).toBe("target");
+  });
+
+  it("ask_instance with valid name posts message", async () => {
+    const callerId = await registerInstance("caller");
+    await registerInstance("backend");
+
+    const result = await rpc(socket, "ask_instance", {
+      instance_id: callerId, target: "backend", question: "which APIs?", repo: "test-repo",
+    }) as { question_id: number; target_name: string };
+
+    expect(result.question_id).toBeGreaterThan(0);
+    expect(result.target_name).toBe("backend");
+  });
+
+  it("ask_instance with invalid slot returns error", async () => {
+    const callerId = await registerInstance("caller");
+    await expect(
+      rpc(socket, "ask_instance", {
+        instance_id: callerId, target: 999, question: "?", repo: "test-repo",
+      })
+    ).rejects.toThrow(/slot #999/);
+  });
+
+  it("ask_instance with unknown name returns error", async () => {
+    const callerId = await registerInstance("caller");
+    await expect(
+      rpc(socket, "ask_instance", {
+        instance_id: callerId, target: "nobody", question: "?", repo: "test-repo",
+      })
+    ).rejects.toThrow(/No active instance named/);
+  });
+
+  it("ask_instance to self works without error", async () => {
+    const callerId = await registerInstance("solo");
+    const { instances } = await rpc(socket, "list_instances", { repo: "test-repo" }) as { instances: Array<{ slot: number; id: string }> };
+    const mySlot = instances.find((i) => i.id === callerId)!.slot;
+
+    const result = await rpc(socket, "ask_instance", {
+      instance_id: callerId, target: mySlot, question: "am I awake?", repo: "test-repo",
+    }) as { question_id: number };
+    expect(result.question_id).toBeGreaterThan(0);
+  });
+});
+
+describe("check_inbox RPC", () => {
+  let daemon: Awaited<ReturnType<typeof startTestDaemon>>;
+  let socket: net.Socket;
+
+  beforeEach(async () => {
+    daemon = await startTestDaemon();
+    socket = net.createConnection(daemon.socketPath);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+  });
+
+  afterEach(async () => {
+    socket.destroy();
+    await daemon.stop();
+  });
+
+  async function registerInstance(name: string, repo = "test-repo"): Promise<string> {
+    const result = await rpc(socket, "register", {
+      name, cwd: `/${name}`, pid: Math.floor(Math.random() * 10000), startup_ts: Date.now(), repo,
+    }) as { instance_id: string };
+    return result.instance_id;
+  }
+
+  it("returns empty when no questions", async () => {
+    const targetId = await registerInstance("target");
+    const result = await rpc(socket, "check_inbox", { instance_id: targetId }) as { questions: unknown[] };
+    expect(result.questions).toHaveLength(0);
+  });
+
+  it("returns unanswered directed questions for caller", async () => {
+    const callerId = await registerInstance("caller");
+    const targetId = await registerInstance("target");
+    const { instances } = await rpc(socket, "list_instances", { repo: "test-repo" }) as { instances: Array<{ slot: number; id: string }> };
+    const targetSlot = instances.find((i) => i.id === targetId)!.slot;
+
+    await rpc(socket, "ask_instance", {
+      instance_id: callerId, target: targetSlot, question: "hello?", repo: "test-repo",
+    });
+
+    const result = await rpc(socket, "check_inbox", { instance_id: targetId }) as { questions: Array<{ content: string }> };
+    expect(result.questions).toHaveLength(1);
+    expect(result.questions[0].content).toBe("hello?");
+  });
+
+  it("answered questions not returned in inbox", async () => {
+    const callerId = await registerInstance("caller");
+    const targetId = await registerInstance("target");
+    const { instances } = await rpc(socket, "list_instances", { repo: "test-repo" }) as { instances: Array<{ slot: number; id: string }> };
+    const targetSlot = instances.find((i) => i.id === targetId)!.slot;
+
+    const { question_id } = await rpc(socket, "ask_instance", {
+      instance_id: callerId, target: targetSlot, question: "hello?", repo: "test-repo",
+    }) as { question_id: number };
+
+    await rpc(socket, "answer", { instance_id: targetId, question_id, answer: "world" });
+
+    const result = await rpc(socket, "check_inbox", { instance_id: targetId }) as { questions: unknown[] };
+    expect(result.questions).toHaveLength(0);
+  });
+});
+
+describe("list_instances slot display", () => {
+  let daemon: Awaited<ReturnType<typeof startTestDaemon>>;
+  let socket: net.Socket;
+
+  beforeEach(async () => {
+    daemon = await startTestDaemon();
+    socket = net.createConnection(daemon.socketPath);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+  });
+
+  afterEach(async () => {
+    socket.destroy();
+    await daemon.stop();
+  });
+
+  it("instances have slot assigned after registration", async () => {
+    await rpc(socket, "register", { name: "A", cwd: "/a", pid: 1, startup_ts: 1, repo: "r" });
+    await rpc(socket, "register", { name: "B", cwd: "/b", pid: 2, startup_ts: 2, repo: "r" });
+    const { instances } = await rpc(socket, "list_instances", { repo: "r" }) as { instances: Array<{ name: string; slot: number }> };
+    expect(instances).toHaveLength(2);
+    const slots = instances.map((i) => i.slot);
+    expect(slots.every((s) => s > 0)).toBe(true);
+    expect(new Set(slots).size).toBe(2); // all unique
   });
 });

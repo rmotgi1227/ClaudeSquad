@@ -24,12 +24,15 @@ import {
   BroadcastParams,
   ReadMessagesParams,
   AskParams,
+  AskInstanceParams,
+  CheckInboxParams,
   AnswerParams,
   HeartbeatParams,
   SetSharedParams,
   GetSharedParams,
   ListInstancesParams,
   MAX_BROADCAST_BYTES,
+  STALE_INSTANCE_MS,
   makeInstanceId,
   nowMs,
 } from "./types.js";
@@ -41,6 +44,7 @@ import {
   listInstances,
   broadcast,
   ask,
+  askInstance,
   answer,
   readMessages,
   setShared,
@@ -48,6 +52,8 @@ import {
   buildStandup,
   pruneOldMessages,
   getInstanceRepo,
+  getInstanceBySlotOrName,
+  checkInbox,
   writeStatusCache,
 } from "./db.js";
 import Database from "better-sqlite3";
@@ -75,7 +81,7 @@ function handleRequest(req: DaemonRequest): unknown {
       const p = req.params as unknown as RegisterParams;
       const id = makeInstanceId(p.name, p.cwd, p.pid, p.startup_ts);
       upsertInstance(db, id, p.name, p.cwd, p.branch ?? null, p.repo);
-      const standup = buildStandup(db, p.repo);
+      const standup = buildStandup(db, p.repo, id);
       return { instance_id: id, standup };
     }
 
@@ -101,7 +107,7 @@ function handleRequest(req: DaemonRequest): unknown {
 
     case "read_messages": {
       const p = req.params as ReadMessagesParams;
-      const msgs = readMessages(db, p.since, p.tags, p.limit, p.repo);
+      const msgs = readMessages(db, p.since, p.tags, p.limit, p.repo, p.reply_to_id);
       return { messages: msgs };
     }
 
@@ -111,6 +117,35 @@ function handleRequest(req: DaemonRequest): unknown {
       const id = ask(db, p.instance_id, p.question, p.context, repo);
       writeStatusCache(db);
       return { message_id: id };
+    }
+
+    case "ask_instance": {
+      const p = req.params as unknown as AskInstanceParams;
+      const resolved = getInstanceBySlotOrName(db, p.target, p.repo);
+      if ("error" in resolved) {
+        throw new Error(resolved.error);
+      }
+      const target = resolved.instance;
+      const id = askInstance(db, p.instance_id, target.id, p.question, p.context, p.repo);
+      writeStatusCache(db);
+
+      const staleCutoff = nowMs() - STALE_INSTANCE_MS;
+      const isStale = target.last_seen > 0 && target.last_seen < staleCutoff + (STALE_INSTANCE_MS * 0.5);
+      return {
+        message_id: id,
+        question_id: id,
+        target_name: target.name,
+        target_last_seen: target.last_seen,
+        stale_warning: isStale
+          ? `Target last seen ${Math.floor((nowMs() - target.last_seen) / 60000)}m ago — may be idle.`
+          : null,
+      };
+    }
+
+    case "check_inbox": {
+      const p = req.params as unknown as CheckInboxParams;
+      const questions = checkInbox(db, p.instance_id, p.limit);
+      return { questions };
     }
 
     case "answer": {

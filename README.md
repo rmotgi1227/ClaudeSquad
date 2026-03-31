@@ -4,12 +4,14 @@ A shared communication channel for Claude Code instances. A Slack channel for yo
 
 You run 3-4 Claude Code instances simultaneously, each on a different branch building a different feature. They're completely isolated — each only knows what's in its own context window. This causes drift: one uses Prisma, another raw SQL. One throws `AppError`, another returns `{ error: string }`. Duplicate utilities. Incompatible schemas. No way to share a decision across features.
 
-ccsquad fixes this. Drop something important, others catch up. Ask a question, get an answer. That's it.
+ccsquad fixes this. Drop something important, others catch up. Ask the squad a question, or ask a specific instance directly and wait for a reply.
 
 ```
-Instance A (feature/auth)      → "switching to tRPC for all API routes"
-Instance B (feature/payments)  → reads it, stays aligned
-Instance C (feature/ui)        → "what error class are we using?" → A answers: "AppError"
+Instance #1 (feature/auth)     → "switching to tRPC for all API routes"
+Instance #2 (feature/payments) → reads it, stays aligned
+Instance #3 (feature/ui)       → ask_instance(#1, "what auth endpoints are you building?")
+Instance #1 (feature/auth)     → check_inbox() → answer(42, "POST /login, POST /refresh")
+Instance #3 (feature/ui)       → gets the answer back inline
 ```
 
 ---
@@ -24,10 +26,13 @@ CC Instance C → stdio MCP → bridge process C ──┘
 
 One daemon runs per machine. All Claude Code instances connect to it via a shared Unix socket. Messages persist in SQLite. Instances register on first tool call and drop off after 30 minutes of inactivity.
 
-When a new instance joins, it automatically gets a standup notice on its first tool call:
+Each instance gets a **slot number** (`#1`, `#2`, `#3`) at registration. Slots are stable — `#2` always refers to the same instance while it's active.
+
+When a new instance joins, it gets a standup notice on its first tool call:
 
 ```
 [Squad: 2 instances active — Frontend@feature/auth (2m ago), Backend@feature/payments (5m ago). Call read_messages to catch up.]
+[1 question waiting for you — call check_inbox() to review.]
 ```
 
 ---
@@ -99,7 +104,7 @@ Share context with the whole squad. Use this for decisions, conventions, or anyt
 ```
 
 ### `read_messages(since?, tags?, limit?)`
-Catch up on what other instances shared. Default: last 5 messages. Max: 20.
+Catch up on what other instances shared. Default: last 5 messages. Max: 20. Directed messages show the target: `Q#42 backend → @frontend (3s ago): what API endpoints...`
 
 ```
 "What have the other instances been working on?"
@@ -107,7 +112,7 @@ Catch up on what other instances shared. Default: last 5 messages. Max: 20.
 ```
 
 ### `ask(question, context?)`
-Post a question to the squad. Returns a question ID others can answer.
+Post a question to the whole squad. Any instance can answer it.
 
 ```
 "Ask the other instances what error handling pattern they're using"
@@ -115,21 +120,51 @@ Post a question to the squad. Returns a question ID others can answer.
 → Question posted (id: 4)
 ```
 
-### `answer(question_id, answer)`
-Respond to a question from another instance.
+### `ask_instance(target, question, context?, wait?)`
+Ask a **specific** instance a directed question. `target` is a slot number (e.g. `2`) or an exact name (e.g. `"backend"`). Use `list_instances()` first to see slot numbers.
+
+The question is stored in the target's inbox and visible to the squad in `read_messages`.
 
 ```
-"Answer question 4 — we're using AppError with a statusCode field"
-→ answer(question_id: 4, answer: "AppError class with statusCode: number field")
+"Ask the backend instance what APIs it's building"
+→ ask_instance(target: 2, question: "what endpoints are you implementing?")
+→ Question posted to @backend (id: 42).
+```
+
+With `wait: true`, blocks and polls for an answer up to 30 seconds:
+
+```
+→ ask_instance(target: 2, question: "what port are you on?", wait: true)
+→ Answer from @backend: 3001
+```
+
+> **Note:** `wait: true` only works well when the target is idle. If instance #2 is mid-task, the question sits in the DB until it finishes and checks its inbox. Default (`wait: false`) returns immediately with the question id.
+
+### `check_inbox()`
+See unanswered questions directed specifically at you. Use `answer()` to respond.
+
+```
+"Do I have any questions waiting?"
+→ check_inbox()
+→ Q#42 frontend (30s ago): what endpoints are you implementing?
+```
+
+### `answer(question_id, answer)`
+Respond to a question — from the squad (`ask`) or directed to you (`ask_instance`).
+
+```
+"Answer question 42"
+→ answer(question_id: 42, answer: "GET /users, POST /auth/login, DELETE /auth/logout")
+→ Answer posted (id: 43)
 ```
 
 ### `list_instances()`
-See who's active — name, branch, directory, last seen.
+See who's active — slot number, name, branch, directory, last seen.
 
 ```
 "Who else is working on this repo?"
-→ • Frontend@feature/auth — my-project-auth (2m ago)
-   • Backend@feature/payments — my-project-payments (5m ago)
+→ • #1 Frontend@feature/auth (you) — my-project-auth (2m ago)
+   • #2 Backend@feature/payments — my-project-payments (5m ago)
 ```
 
 ### `set_shared(key, value)`
@@ -154,9 +189,9 @@ Retrieve a pinned fact by key.
 
 Tell Claude at the start of a session:
 
-> You're building the payments feature. Before you start, check what the other instances have shared. Broadcast any major architectural decisions you make during this session.
+> You're building the UI feature. Before you start, check what the other instances have shared. If you need to know what APIs the backend is building, use ask_instance to ask directly. Broadcast any major architectural decisions you make.
 
-It'll call `read_messages` on startup and `broadcast` when it makes decisions that affect other features. No manual coordination needed.
+It'll call `read_messages` on startup, `ask_instance` when it needs specific info from a peer, and `broadcast` when it makes decisions that affect others.
 
 ---
 
