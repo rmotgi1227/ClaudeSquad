@@ -1,10 +1,10 @@
-# claude-squad
+# ccsquad
 
 A shared communication channel for Claude Code instances. A Slack channel for your agents.
 
 You run 3-4 Claude Code instances simultaneously, each on a different branch building a different feature. They're completely isolated — each only knows what's in its own context window. This causes drift: one uses Prisma, another raw SQL. One throws `AppError`, another returns `{ error: string }`. Duplicate utilities. Incompatible schemas. No way to share a decision across features.
 
-claude-squad fixes this. Drop something important, others catch up. Ask a question, get an answer. That's it.
+ccsquad fixes this. Drop something important, others catch up. Ask a question, get an answer. That's it.
 
 ```
 Instance A (feature/auth)      → "switching to tRPC for all API routes"
@@ -18,27 +18,36 @@ Instance C (feature/ui)        → "what error class are we using?" → A answer
 
 ```
 CC Instance A → stdio MCP → bridge process A ──┐
-CC Instance B → stdio MCP → bridge process B ──┼──► shared daemon → SQLite (~/.claude-squad/)
+CC Instance B → stdio MCP → bridge process B ──┼──► shared daemon → SQLite (~/.ccsquad/)
 CC Instance C → stdio MCP → bridge process C ──┘
 ```
 
 One daemon runs per machine. All Claude Code instances connect to it via a shared Unix socket. Messages persist in SQLite. Instances register on first tool call and drop off after 30 minutes of inactivity.
+
+When a new instance joins, it automatically gets a standup notice on its first tool call:
+
+```
+[Squad: 2 instances active — Frontend@feature/auth (2m ago), Backend@feature/payments (5m ago). Call read_messages to catch up.]
+```
 
 ---
 
 ## Install
 
 ```bash
-npm install -g claude-squad
+npm install -g ccsquad
+ccsquad init
 ```
 
-Then register it as a global MCP server:
+`init` does everything: registers the MCP server in `~/.claude.json`, injects coordination instructions into your project's `CLAUDE.md`, and starts the daemon.
+
+Options:
 
 ```bash
-claude mcp add --scope user claude-squad claude-squad
+ccsquad init --mode aggressive   # more proactive broadcasting
+ccsquad init --status-line       # adds a message count to your terminal status line
+ccsquad init --update            # re-run to change mode or refresh instructions
 ```
-
-That's it. The daemon starts automatically on first use.
 
 ---
 
@@ -62,7 +71,7 @@ cd ../my-project-auth && claude
 cd ../my-project-payments && claude
 ```
 
-Each instance auto-registers with its branch name. `list_instances` in either window sees the full squad.
+Each instance auto-registers with its branch name. `list_instances` in either window sees the full squad. Messages are scoped to the repo — instances in different projects don't see each other's messages.
 
 ---
 
@@ -71,11 +80,9 @@ Each instance auto-registers with its branch name. `list_instances` in either wi
 By default instances are named after their directory. Set a custom name:
 
 ```bash
-export CLAUDE_SQUAD_NAME="Frontend"
+export CCSQUAD_NAME="Frontend"
 claude
 ```
-
-Messages will show `Frontend says:` instead of `my-project-auth says:`.
 
 ---
 
@@ -149,7 +156,7 @@ Tell Claude at the start of a session:
 
 > You're building the payments feature. Before you start, check what the other instances have shared. Broadcast any major architectural decisions you make during this session.
 
-It'll call `read_messages` on startup and `broadcast` when it makes calls that affect other features. No manual coordination needed.
+It'll call `read_messages` on startup and `broadcast` when it makes decisions that affect other features. No manual coordination needed.
 
 ---
 
@@ -157,10 +164,13 @@ It'll call `read_messages` on startup and `broadcast` when it makes calls that a
 
 ```bash
 # Check squad status (works without Claude)
-claude-squad status
+ccsquad status
 
 # Export channel history as markdown (paste into any session)
-claude-squad export > context.md
+ccsquad export > context.md
+
+# Remove everything (MCP, CLAUDE.md block, daemon, data)
+ccsquad uninstall
 ```
 
 ---
@@ -170,7 +180,7 @@ claude-squad export > context.md
 Everything is stored locally on your machine:
 
 ```
-~/.claude-squad/
+~/.ccsquad/
   state.db      ← SQLite database (messages, instances, KV)
   server.sock   ← Unix socket (daemon IPC)
 ```
